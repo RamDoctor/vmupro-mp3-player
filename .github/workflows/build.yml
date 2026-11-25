@@ -20,7 +20,8 @@ jobs:
       - name: Fetch minimp3.h and move scratch buffer off stack
         shell: bash
         run: |
-          curl -sL https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h -o main/minimp3.h
+          mkdir -p main
+          curl -fsSL --create-dirs https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h -o main/minimp3.h
           sed -i 's/mp3dec_scratch_t scratch;/static mp3dec_scratch_t scratch;/g' main/minimp3.h
 
       - name: Convert icon.png to 76x76 icon.bmp (if present)
