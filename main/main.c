@@ -4,6 +4,45 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* --- Local replacements for symbols not exported by VMUPro OS --- */
+
+/* 1. memmove replacement for minimp3 and libc calls */
+void *memmove(void *dst, const void *src, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    if (d < s) {
+        for (size_t i = 0; i < n; i++) d[i] = s[i];
+    } else if (d > s) {
+        for (size_t i = n; i > 0; i--) d[i - 1] = s[i - 1];
+    }
+    return dst;
+}
+
+/* 2. Soft-float division helper (__divsf3) */
+float __divsf3(float a, float b) {
+    union { float f; uint32_t u; } ua = { .f = a }, ub = { .f = b };
+    uint32_t sign = (ua.u ^ ub.u) & 0x80000000U;
+    int32_t exp_a = (int32_t)((ua.u >> 23) & 0xFF);
+    int32_t exp_b = (int32_t)((ub.u >> 23) & 0xFF);
+    if (exp_a == 0) return 0.0f;
+    if (exp_b == 0) return (sign ? -1.0e30f : 1.0e30f);
+
+    uint64_t man_a = ((uint64_t)(ua.u & 0x7FFFFF) | 0x800000ULL) << 24;
+    uint64_t man_b = ((uint64_t)(ub.u & 0x7FFFFF) | 0x800000ULL);
+    uint32_t quot = (uint32_t)(man_a / man_b);
+    int32_t exp_r = exp_a - exp_b + 127;
+
+    while (quot >= 0x01000000U) { quot >>= 1; exp_r++; }
+    while (quot < 0x00800000U && exp_r > 0) { quot <<= 1; exp_r--; }
+
+    if (exp_r <= 0) return 0.0f;
+    if (exp_r >= 255) exp_r = 254;
+
+    union { uint32_t u; float f; } res;
+    res.u = sign | ((uint32_t)exp_r << 23) | (quot & 0x7FFFFFU);
+    return res.f;
+}
+
 #define MINIMP3_ONLY_MP3
 #define MINIMP3_NO_SIMD
 #define MINIMP3_IMPLEMENTATION
@@ -111,7 +150,7 @@ static void seek_seconds(int delta_sec) {
     vmupro_audio_clear_ring_buffer();
 
     int kbps = (g_bitrate > 0) ? g_bitrate : 128;
-    long delta_bytes = (long)delta_sec * (long)kbps * 125L;
+    long delta_bytes = (long)delta_sec * (long)(kbps * 125);
     long cur_approx = g_file_pos - (g_in_len - g_in_pos);
     long target = cur_approx + delta_bytes;
     if (target < g_audio_start) target = g_audio_start;
@@ -127,7 +166,8 @@ static void seek_seconds(int delta_sec) {
     g_prev_sample = 0;
     mp3dec_init(g_dec);
 
-    int32_t new_sec = (int32_t)((target - g_audio_start) / ((long)kbps * 125L));
+    long byte_rate = (long)(kbps * 125);
+    int32_t new_sec = (byte_rate > 0) ? (int32_t)((target - g_audio_start) / byte_rate) : 0;
     if (new_sec < 0) new_sec = 0;
     g_samples_played = (uint32_t)new_sec * OUT_HZ;
 }
@@ -219,7 +259,8 @@ static void pump_audio(void) {
             vmupro_audio_add_stream_samples(g_mono_buf, samples, VMUPRO_AUDIO_MONO, true);
             g_samples_played += (uint32_t)samples;
         } else {
-            uint32_t step = (uint32_t)(((uint64_t)g_sample_hz << 16) / OUT_HZ);
+            /* 32-bit fixed-point resampling step (avoids 64-bit __udivdi3) */
+            uint32_t step = (((uint32_t)g_sample_hz << 12) / (OUT_HZ >> 4));
             int out_cnt = 0;
             uint32_t limit = (uint32_t)samples << 16;
             while (g_phase < limit && out_cnt < 4096) {
@@ -254,7 +295,7 @@ static void render_player(void) {
     vmupro_snprintf(hdr, sizeof(hdr), "Vol:%u%%", (unsigned)vol);
     vmupro_draw_text(hdr, 172, 6, VMUPRO_COLOR_WHITE, VMUPRO_COLOR_BLACK);
 
-    /* Track name box (filename only, no ID3 tags) */
+    /* Track name box (filename only) */
     vmupro_draw_fill_rect(6, 26, 234, 72, VMUPRO_COLOR_NAVY);
     vmupro_draw_rect(6, 26, 234, 72, VMUPRO_COLOR_BLUE);
     char line1[30], line2[30];
@@ -282,14 +323,14 @@ static void render_player(void) {
         vmupro_draw_text(info_str, 126, 84, VMUPRO_COLOR_GREY, VMUPRO_COLOR_BLACK);
     }
 
-    /* File progress bar */
+    /* Progress bar (pure 32-bit math, no __udivdi3) */
     vmupro_draw_rect(10, 104, 230, 114, VMUPRO_COLOR_GREY);
     if (g_fp && g_file_size > (size_t)g_audio_start) {
         long cur = g_file_pos - (g_in_len - g_in_pos);
         if (cur < g_audio_start) cur = g_audio_start;
         uint32_t span = (uint32_t)(g_file_size - (size_t)g_audio_start);
         uint32_t pos = (uint32_t)(cur - g_audio_start);
-        int fill_w = (span > 0) ? (int)((pos * 218ULL) / span) : 0;
+        int fill_w = (span > 0) ? (int)((pos / (span / 218U + 1U))) : 0;
         if (fill_w > 218) fill_w = 218;
         if (fill_w > 0) vmupro_draw_fill_rect(11, 105, 11 + fill_w, 113, VMUPRO_COLOR_VMUGREEN);
     }
@@ -364,7 +405,6 @@ void app_main(void) {
     vmupro_audio_start_listen_mode();
     vmupro_start_double_buffer_renderer();
 
-    /* Open the /sdcard/mp3/ browser immediately on launch */
     char initial_pick[256];
     if (browse_for_mp3(initial_pick, sizeof(initial_pick))) {
         open_track(initial_pick);
