@@ -18,7 +18,7 @@ float __divsf3(float a, float b) {
     union { float f; uint32_t u; } ua = { .f = a }, ub = { .f = b };
     uint32_t sign = (ua.u ^ ub.u) & 0x80000000U;
     int32_t ea = (int32_t)((ua.u >> 23) & 0xFF), eb = (int32_t)((ub.u >> 23) & 0xFF);
-    if (exp_a_zero: ea == 0) return 0.0f;
+    if (ea == 0) return 0.0f;
     if (eb == 0) return (sign ? -1.0e30f : 1.0e30f);
     uint64_t ma = ((uint64_t)(ua.u & 0x7FFFFF) | 0x800000ULL) << 24;
     uint64_t mb = ((uint64_t)(ub.u & 0x7FFFFF) | 0x800000ULL);
