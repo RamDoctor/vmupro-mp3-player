@@ -3,7 +3,7 @@
   "app_name": "MP3 Player",
   "app_author": "Your Name",
   "app_version": "1.0.0",
-  "app_mode": 2,
+  "app_mode": 3,
   "app_environment": "native",
   "icon_transparency": false,
   "app_entry_point": "app_main",
