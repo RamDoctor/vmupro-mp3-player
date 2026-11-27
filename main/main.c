@@ -5,22 +5,16 @@
 #include <stdint.h>
 
 /* --- Local implementations of symbols not exported by VMUPro OS --- */
-
-/* 1. 64-bit unsigned division helper (__udivdi3) */
 uint64_t __udivdi3(uint64_t n, uint64_t d) {
     if (d == 0) return 0;
     uint64_t q = 0, r = 0;
     for (int i = 63; i >= 0; i--) {
         r = (r << 1) | ((n >> i) & 1ULL);
-        if (r >= d) {
-            r -= d;
-            q |= (1ULL << i);
-        }
+        if (r >= d) { r -= d; q |= (1ULL << i); }
     }
     return q;
 }
 
-/* 2. Soft-float division helper (__divsf3) */
 float __divsf3(float a, float b) {
     union { float f; uint32_t u; } ua = { .f = a }, ub = { .f = b };
     uint32_t sign = (ua.u ^ ub.u) & 0x80000000U;
@@ -36,7 +30,6 @@ float __divsf3(float a, float b) {
 
     while (quot >= 0x01000000U) { quot >>= 1; exp_r++; }
     while (quot < 0x00800000U && exp_r > 0) { quot <<= 1; exp_r--; }
-
     if (exp_r <= 0) return 0.0f;
     if (exp_r >= 255) exp_r = 254;
 
@@ -45,15 +38,11 @@ float __divsf3(float a, float b) {
     return res.f;
 }
 
-/* 3. memmove replacement for minimp3 and libc */
 void *memmove(void *dst, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
-    if (d < s) {
-        for (size_t i = 0; i < n; i++) d[i] = s[i];
-    } else if (d > s) {
-        for (size_t i = n; i > 0; i--) d[i - 1] = s[i - 1];
-    }
+    if (d < s) { for (size_t i = 0; i < n; i++) d[i] = s[i]; }
+    else if (d > s) { for (size_t i = n; i > 0; i--) d[i - 1] = s[i - 1]; }
     return dst;
 }
 
@@ -63,7 +52,7 @@ void *memmove(void *dst, const void *src, size_t n) {
 #include "minimp3.h"
 #include "vmupro_sdk.h"
 
-#define MP3_ROOT "/sdcard/mp3/"
+#define MP3_ROOT "/sdcard/mp3"
 #define IN_BUF_SIZE 16384
 #define OUT_HZ 44100
 
@@ -98,6 +87,13 @@ static int g_sample_hz = 44100, g_bitrate = 128;
 static uint32_t g_samples_played = 0;
 static uint32_t g_phase = 0;
 static int16_t g_prev_sample = 0;
+
+static void draw_box_outline(int x1, int y1, int x2, int y2, vmupro_color_t col) {
+    vmupro_draw_fill_rect(x1, y1, x2, y1 + 1, col);
+    vmupro_draw_fill_rect(x1, y2 - 1, x2, y2, col);
+    vmupro_draw_fill_rect(x1, y1, x1 + 1, y2, col);
+    vmupro_draw_fill_rect(x2 - 1, y1, x2, y2, col);
+}
 
 static const char *base_filename(const char *path) {
     const char *slash = strrchr(path, '/');
@@ -310,7 +306,7 @@ static void render_player(void) {
 
     /* Track name box */
     vmupro_draw_fill_rect(6, 26, 234, 72, VMUPRO_COLOR_NAVY);
-    vmupro_draw_rect(6, 26, 234, 72, VMUPRO_COLOR_BLUE);
+    draw_box_outline(6, 26, 234, 72, VMUPRO_COLOR_BLUE);
     char line1[30], line2[30];
     size_t nlen = strlen(g_cur_name);
     size_t c1 = nlen > 28 ? 28 : nlen;
@@ -337,7 +333,7 @@ static void render_player(void) {
     }
 
     /* Progress bar */
-    vmupro_draw_rect(10, 104, 230, 114, VMUPRO_COLOR_GREY);
+    draw_box_outline(10, 104, 230, 114, VMUPRO_COLOR_GREY);
     if (g_fp && g_file_size > (size_t)g_audio_start) {
         long cur = g_file_pos - (g_in_len - g_in_pos);
         if (cur < g_audio_start) cur = g_audio_start;
@@ -357,7 +353,7 @@ static void render_player(void) {
         vmupro_color_t bg = sel ? VMUPRO_COLOR_BLUE : VMUPRO_COLOR_NAVY;
         vmupro_color_t br = sel ? VMUPRO_COLOR_YELLOW : VMUPRO_COLOR_GREY;
         vmupro_draw_fill_rect(x1, y1, x2, y2, bg);
-        vmupro_draw_rect(x1, y1, x2, y2, br);
+        draw_box_outline(x1, y1, x2, y2, br);
 
         const char *lbl = g_btn_labels[i];
         if (i == ACT_PLAY) lbl = (g_playing && !g_paused) ? "Pause" : "Play";
@@ -439,7 +435,7 @@ void app_main(void) {
 
         pump_audio();
         render_player();
-        vmupro_sleep_ms(16);
+        vmupro_sleep_ms(g_playing && !g_paused ? 5 : 16);
     }
 
     close_track();
