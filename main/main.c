@@ -18,7 +18,7 @@ float __divsf3(float a, float b) {
     union { float f; uint32_t u; } ua = { .f = a }, ub = { .f = b };
     uint32_t sign = (ua.u ^ ub.u) & 0x80000000U;
     int32_t ea = (int32_t)((ua.u >> 23) & 0xFF), eb = (int32_t)((ub.u >> 23) & 0xFF);
-    if (ea == 0) return 0.0f;
+    if (exp_a_zero: ea == 0) return 0.0f;
     if (eb == 0) return (sign ? -1.0e30f : 1.0e30f);
     uint64_t ma = ((uint64_t)(ua.u & 0x7FFFFF) | 0x800000ULL) << 24;
     uint64_t mb = ((uint64_t)(ub.u & 0x7FFFFF) | 0x800000ULL);
@@ -46,12 +46,11 @@ void *memmove(void *dst, const void *src, size_t n) {
 
 #define MP3_ROOT "/sdcard/mp3"
 #define INDEX_DIR "/sdcard/apps/WiFi Transfer"
-#define MAX_TRACKS 200
-#define PATH_MAX_LEN 160
+#define MAX_TRACKS 300
+#define PATH_MAX_LEN 200
 #define IN_BUF_SIZE 16384
 #define OUT_HZ 44100
 
-/* 2 pages x 8 grid slots */
 enum {
     P0_REW = 0, P0_PLAY, P0_FWD, P0_SUB,
     P0_PREV,    P0_NONE, P0_NEXT, P0_EXIT,
@@ -79,21 +78,31 @@ static bool g_sleeping = false, g_ui_dirty = true;
 static int g_page = 0, g_sel = P0_PLAY, g_vol_pct = 100;
 static uint8_t g_saved_bright = 80;
 static int g_sample_hz = 44100, g_bitrate = 128;
-static uint32_t g_samples_played = 0, g_phase = 0;
+static uint32_t g_samples_played = 0, g_samples_fed = 0, g_phase = 0;
 static int16_t g_prev_sample = 0;
-static uint64_t g_last_ui_us = 0, g_last_mode_us = 0;
+static uint64_t g_last_ui_us = 0, g_last_mode_us = 0, g_audio_clock_start_us = 0;
 
 static bool ends_with_mp3(const char *s, size_t len) {
     if (len < 4) return false;
     const char *e = s + len - 4;
     return e[0] == '.' && (e[1] == 'm' || e[1] == 'M') && (e[2] == 'p' || e[2] == 'P') && e[3] == '3';
 }
-static int my_strncmp(const char *a, const char *b, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        if (a[i] != b[i]) return (unsigned char)a[i] - (unsigned char)b[i];
-        if (!a[i]) return 0;
+static int my_strcasecmp(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+        char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+        if (ca != cb) return (unsigned char)ca - (unsigned char)cb;
+        a++; b++;
     }
-    return 0;
+    return (unsigned char)*a - (unsigned char)*b;
+}
+static void normalize_path(const char *in, char *out, size_t sz) {
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j + 1 < sz; i++) {
+        if (in[i] == '/' && j > 0 && out[j - 1] == '/') continue;
+        out[j++] = in[i];
+    }
+    out[j] = '\0';
 }
 static const char *base_filename(const char *path) {
     const char *slash = strrchr(path, '/');
@@ -105,6 +114,47 @@ static void draw_box_outline(int x1, int y1, int x2, int y2, vmupro_color_t col)
     vmupro_draw_fill_rect(x1, y1, x1 + 1, y2, col);
     vmupro_draw_fill_rect(x2 - 1, y1, x2, y2, col);
 }
+static void reset_audio_clock(void) {
+    g_audio_clock_start_us = vmupro_get_time_us();
+    g_samples_fed = 0;
+}
+
+static void parse_index_file(const char *ppath) {
+    size_t sz = vmupro_get_file_size(ppath);
+    if (sz == (size_t)-1 || sz == 0) return;
+    if (sz > 32768) sz = 32768;
+    FILE *f = fopen(ppath, "rb");
+    if (!f) return;
+    char *buf = (char *)malloc(sz + 1);
+    if (buf) {
+        size_t n = fread(buf, 1, sz, f);
+        buf[n] = '\0';
+        const char *p = buf;
+        char norm[PATH_MAX_LEN];
+        while (*p && g_track_cnt < MAX_TRACKS) {
+            const char *nl = p;
+            while (*nl && *nl != '\n' && *nl != '\r') nl++;
+            size_t ll = (size_t)(nl - p);
+            if (ll > 0 && ll < PATH_MAX_LEN && ends_with_mp3(p, ll)) {
+                char tmp[PATH_MAX_LEN];
+                memcpy(tmp, p, ll); tmp[ll] = '\0';
+                normalize_path(tmp, norm, sizeof(norm));
+                bool dup = false;
+                for (int k = 0; k < g_track_cnt; k++) {
+                    if (my_strcasecmp(g_tracks[k], norm) == 0) { dup = true; break; }
+                }
+                if (!dup) {
+                    memcpy(g_tracks[g_track_cnt], norm, strlen(norm) + 1);
+                    g_track_cnt++;
+                }
+            }
+            p = *nl ? nl + 1 : nl;
+            while (*p == '\n' || *p == '\r') p++;
+        }
+        free(buf);
+    }
+    fclose(f);
+}
 
 static void load_playlist_from_index(void) {
     if (!g_tracks) return;
@@ -113,38 +163,19 @@ static void load_playlist_from_index(void) {
     for (int pg = 1; pg <= 32 && g_track_cnt < MAX_TRACKS; pg++) {
         if (pg == 1) vmupro_snprintf(ppath, sizeof(ppath), "%s/wifi_files.txt", INDEX_DIR);
         else vmupro_snprintf(ppath, sizeof(ppath), "%s/wifi_files_%d.txt", INDEX_DIR, pg);
-        size_t sz = vmupro_get_file_size(ppath);
-        if (sz == (size_t)-1 || sz == 0) { if (pg == 1) continue; else break; }
-        if (sz > 32768) sz = 32768;
-        FILE *f = fopen(ppath, "rb");
-        if (!f) continue;
-        char *buf = (char *)malloc(sz + 1);
-        if (buf) {
-            size_t n = fread(buf, 1, sz, f);
-            buf[n] = '\0';
-            const char *p = buf;
-            while (*p && g_track_cnt < MAX_TRACKS) {
-                const char *nl = p;
-                while (*nl && *nl != '\n' && *nl != '\r') nl++;
-                size_t ll = (size_t)(nl - p);
-                if (ll > 0 && ll < PATH_MAX_LEN && my_strncmp(p, MP3_ROOT, strlen(MP3_ROOT)) == 0 && ends_with_mp3(p, ll)) {
-                    memcpy(g_tracks[g_track_cnt], p, ll);
-                    g_tracks[g_track_cnt][ll] = '\0';
-                    g_track_cnt++;
-                }
-                p = *nl ? nl + 1 : nl;
-                while (*p == '\n' || *p == '\r') p++;
-            }
-            free(buf);
-        }
-        fclose(f);
+        if (vmupro_get_file_size(ppath) == (size_t)-1) { if (pg == 1) continue; else break; }
+        parse_index_file(ppath);
     }
+    if (g_track_cnt == 0) parse_index_file("/sdcard/wifi_files.txt");
+    if (g_track_cnt == 0) parse_index_file("/sdcard/mp3/playlist.txt");
 }
 
 static void sync_track_idx(const char *path) {
+    char norm[PATH_MAX_LEN];
+    normalize_path(path, norm, sizeof(norm));
     g_track_idx = -1;
     for (int i = 0; i < g_track_cnt; i++) {
-        if (strcmp(g_tracks[i], path) == 0) { g_track_idx = i; return; }
+        if (my_strcasecmp(g_tracks[i], norm) == 0) { g_track_idx = i; return; }
     }
 }
 
@@ -153,7 +184,7 @@ static void close_track(void) {
     vmupro_audio_clear_ring_buffer();
     g_playing = false; g_paused = false;
     g_in_len = 0; g_in_pos = 0;
-    g_samples_played = 0; g_phase = 0; g_prev_sample = 0;
+    g_samples_played = 0; g_samples_fed = 0; g_phase = 0; g_prev_sample = 0;
 }
 
 static long skip_id3v2(FILE *fp) {
@@ -173,18 +204,21 @@ static long skip_id3v2(FILE *fp) {
 static bool open_track(const char *path) {
     close_track();
     if (!path || !path[0]) return false;
-    size_t fsz = vmupro_get_file_size(path);
-    FILE *fp = fopen(path, "rb");
+    char norm[PATH_MAX_LEN];
+    normalize_path(path, norm, sizeof(norm));
+    size_t fsz = vmupro_get_file_size(norm);
+    FILE *fp = fopen(norm, "rb");
     if (!fp || fsz == (size_t)-1) { if (fp) fclose(fp); return false; }
 
     g_fp = fp; g_file_size = fsz;
-    strncpy(g_cur_path, path, sizeof(g_cur_path) - 1); g_cur_path[sizeof(g_cur_path) - 1] = '\0';
-    strncpy(g_cur_name, base_filename(path), sizeof(g_cur_name) - 1); g_cur_name[sizeof(g_cur_name) - 1] = '\0';
+    strncpy(g_cur_path, norm, sizeof(g_cur_path) - 1); g_cur_path[sizeof(g_cur_path) - 1] = '\0';
+    strncpy(g_cur_name, base_filename(norm), sizeof(g_cur_name) - 1); g_cur_name[sizeof(g_cur_name) - 1] = '\0';
     sync_track_idx(g_cur_path);
 
     g_audio_start = skip_id3v2(g_fp);
     g_file_pos = g_audio_start;
     mp3dec_init(g_dec);
+    reset_audio_clock();
     g_playing = true; g_paused = false; g_ui_dirty = true;
     return true;
 }
@@ -216,6 +250,7 @@ static void seek_seconds(int delta_sec) {
     fseek(g_fp, target, SEEK_SET);
     g_file_pos = target; g_in_len = 0; g_in_pos = 0; g_phase = 0; g_prev_sample = 0;
     mp3dec_init(g_dec);
+    reset_audio_clock();
     int32_t new_sec = (int32_t)((target - g_audio_start) / (long)(kbps * 125));
     g_samples_played = (new_sec > 0) ? (uint32_t)new_sec * OUT_HZ : 0;
     g_ui_dirty = true;
@@ -236,6 +271,7 @@ static bool browse_for_mp3(char *out_path) {
         vmupro_emubrowser_render_contents(out_path);
     }
     vmupro_start_double_buffer_renderer();
+    reset_audio_clock();
     g_ui_dirty = true;
     return (out_path[0] != '\0');
 }
@@ -262,20 +298,26 @@ static void apply_vol_and_send(int16_t *samples, int count) {
         }
     }
     vmupro_audio_add_stream_samples(samples, count, VMUPRO_AUDIO_MONO, true);
+    g_samples_fed += (uint32_t)count;
+    g_samples_played += (uint32_t)count;
 }
 
 static void pump_audio(void) {
     if (!g_playing || g_paused || !g_fp) return;
 
+    /* Wall-clock pacing: never feed faster than 44.1 kHz + 120 ms jitter cushion (fixes USB-C skipping!) */
+    uint64_t now = vmupro_get_time_us();
+    uint32_t elapsed_ms = (uint32_t)__udivdi3(now - g_audio_clock_start_us, 1000ULL);
+    uint32_t max_allowed = (uint32_t)__udivdi3((uint64_t)elapsed_ms * 441ULL, 10ULL) + 5292U;
+    if (g_samples_fed >= max_allowed) return;
+
     uint32_t filled = 0, total = 0;
     int pct = vmupro_get_ringbuffer_fill_state(&filled, &total);
     uint32_t free_samp = (total > filled) ? (total - filled) : 0;
-
-    /* Prevent USB-C ringbuffer overflow: only decode when enough free space exists */
-    if ((total > 0 && free_samp < 1600) || (total == 0 && pct >= 60)) return;
+    if (total > 0 && free_samp < 1600) return;
 
     int frames_sent = 0;
-    while (frames_sent < 2) {
+    while (frames_sent < 2 && g_samples_fed < max_allowed) {
         if (g_in_len - g_in_pos < 2048) {
             int rem = g_in_len - g_in_pos;
             if (rem > 0 && g_in_pos > 0) memmove(g_in_buf, g_in_buf + g_in_pos, (size_t)rem);
@@ -289,6 +331,7 @@ static void pump_audio(void) {
                 fseek(g_fp, g_audio_start, SEEK_SET);
                 g_file_pos = g_audio_start; g_in_len = 0; g_in_pos = 0; g_samples_played = 0;
                 mp3dec_init(g_dec);
+                reset_audio_clock();
                 continue;
             } else if (g_track_cnt > 1) {
                 step_track(1);
@@ -318,7 +361,6 @@ static void pump_audio(void) {
 
         if (g_sample_hz == OUT_HZ) {
             apply_vol_and_send(g_mono_buf, samples);
-            g_samples_played += (uint32_t)samples;
         } else {
             uint32_t step = (((uint32_t)g_sample_hz << 12) / (OUT_HZ >> 4));
             int out_cnt = 0;
@@ -332,15 +374,13 @@ static void pump_audio(void) {
             }
             g_phase -= limit;
             g_prev_sample = g_mono_buf[samples - 1];
-            if (out_cnt > 0) {
-                apply_vol_and_send(g_resamp_buf, out_cnt);
-                g_samples_played += (uint32_t)out_cnt;
-            }
+            if (out_cnt > 0) apply_vol_and_send(g_resamp_buf, out_cnt);
         }
         frames_sent++;
         pct = vmupro_get_ringbuffer_fill_state(&filled, &total);
         free_samp = (total > filled) ? (total - filled) : 0;
-        if ((total > 0 && free_samp < 1600) || (total == 0 && pct >= 60)) break;
+        if (total > 0 && free_samp < 1600) break;
+        (void)pct;
     }
 }
 
@@ -351,14 +391,15 @@ static void render_player(void) {
     char hdr[32];
     if (g_track_cnt > 0 && g_track_idx >= 0) {
         vmupro_snprintf(hdr, sizeof(hdr), "Track %d/%d", g_track_idx + 1, g_track_cnt);
+    } else if (g_track_cnt > 0) {
+        vmupro_snprintf(hdr, sizeof(hdr), "%d MP3s", g_track_cnt);
     } else {
-        vmupro_snprintf(hdr, sizeof(hdr), "Batt: N/A");
+        vmupro_snprintf(hdr, sizeof(hdr), "No index");
     }
     vmupro_draw_text(hdr, 8, 6, VMUPRO_COLOR_VMUGREEN, VMUPRO_COLOR_BLACK);
     vmupro_snprintf(hdr, sizeof(hdr), "Vol:%d%%", g_vol_pct);
     vmupro_draw_text(hdr, 170, 6, VMUPRO_COLOR_WHITE, VMUPRO_COLOR_BLACK);
 
-    /* Track filename box */
     vmupro_draw_fill_rect(6, 26, 234, 72, VMUPRO_COLOR_NAVY);
     draw_box_outline(6, 26, 234, 72, VMUPRO_COLOR_BLUE);
     char line1[30], line2[30];
@@ -382,7 +423,6 @@ static void render_player(void) {
         vmupro_draw_text(info_str, 126, 84, VMUPRO_COLOR_GREY, VMUPRO_COLOR_BLACK);
     }
 
-    /* Progress bar */
     draw_box_outline(10, 104, 230, 114, VMUPRO_COLOR_GREY);
     if (g_fp && g_file_size > (size_t)g_audio_start) {
         long cur = g_file_pos - (g_in_len - g_in_pos);
@@ -394,18 +434,16 @@ static void render_player(void) {
         if (fill_w > 0) vmupro_draw_fill_rect(11, 105, 11 + fill_w, 113, VMUPRO_COLOR_VMUGREEN);
     }
 
-    /* 2x4 Selectable Controls (Page 0 or Page 1) */
     const char *p0[8] = { "<<10s", (g_playing && !g_paused) ? "Pause" : "Play", "10s>>", "Sub >", "|<Prv", "", "Nxt>|", "Exit" };
     const char *p1[8] = { "Vol-", "Vol+", "Loop", "<Main", "Sleep", "", "Files", "Exit" };
     for (int i = 0; i < 8; i++) {
         int col = i % 4, row = i / 4;
         int x1 = 6 + col * 58, y1 = 128 + row * 40, x2 = x1 + 54, y2 = y1 + 34;
         const char *lbl = (g_page == 0) ? p0[i] : p1[i];
-        if (!lbl[0]) continue; /* leave slot under Play / Vol+ empty */
+        if (!lbl[0]) continue;
 
         bool sel = (i == g_sel);
-        vmupro_color_t bg = VMUPRO_COLOR_NAVY;
-        vmupro_color_t fg = VMUPRO_COLOR_WHITE;
+        vmupro_color_t bg = VMUPRO_COLOR_NAVY, fg = VMUPRO_COLOR_WHITE;
         if (g_page == 1 && i == P1_LOOP) {
             bg = g_loop ? VMUPRO_COLOR_ORANGE : VMUPRO_COLOR_BLUE;
             if (g_loop) fg = VMUPRO_COLOR_BLACK;
@@ -430,11 +468,11 @@ static void move_sel(int dcol, int drow) {
     int col = g_sel % 4, row = g_sel / 4;
     if (dcol != 0) {
         col = (col + dcol + 4) % 4;
-        if (row == 1 && col == 1) col = (col + dcol + 4) % 4; /* skip empty slot 5 */
+        if (row == 1 && col == 1) col = (col + dcol + 4) % 4;
     }
     if (drow != 0) {
         row = (row + 1) % 2;
-        if (row == 1 && col == 1) col = 0; /* skip empty slot 5 */
+        if (row == 1 && col == 1) col = 0;
     }
     g_sel = row * 4 + col;
     g_ui_dirty = true;
@@ -444,8 +482,11 @@ static void activate_selection(void) {
     if (g_page == 0) {
         if (g_sel == P0_PLAY) {
             if (!g_fp && g_cur_path[0]) open_track(g_cur_path);
-            else if (g_playing) { g_paused = !g_paused; if (g_paused) vmupro_audio_clear_ring_buffer(); }
-            else if (g_cur_path[0]) open_track(g_cur_path);
+            else if (g_playing) {
+                g_paused = !g_paused;
+                if (g_paused) vmupro_audio_clear_ring_buffer();
+                else reset_audio_clock();
+            } else if (g_cur_path[0]) open_track(g_cur_path);
         } else if (g_sel == P0_REW) seek_seconds(-10);
         else if (g_sel == P0_FWD) seek_seconds(10);
         else if (g_sel == P0_SUB) { g_page = 1; g_sel = P1_MAIN; }
@@ -488,7 +529,7 @@ void app_main(void) {
         } else if (g_sleeping) {
             if (vmupro_btn_pressed(Btn_Mode)) {
                 uint64_t now = vmupro_get_time_us();
-                if (g_last_mode_us != 0 && ((now - g_last_mode_us) >> 10) <= 500) {
+                if (g_last_mode_us != 0 && ((now - g_last_mode_us) >> 10) <= 600) {
                     g_last_mode_us = 0;
                     step_track(1);
                 } else {
@@ -511,7 +552,7 @@ void app_main(void) {
 
         if (!g_sleeping) {
             uint64_t now = vmupro_get_time_us();
-            if (g_ui_dirty || ((now - g_last_ui_us) >> 10) >= 250) {
+            if (g_ui_dirty || ((now - g_last_ui_us) >> 10) >= 83) {
                 render_player();
             }
         }
