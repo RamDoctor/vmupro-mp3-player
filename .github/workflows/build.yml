@@ -17,48 +17,153 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Fetch minimp3.h and move scratch buffer off stack
+      - name: Fetch minimp3.h
         shell: bash
         run: |
           mkdir -p main
           curl -fsSL --create-dirs https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h -o main/minimp3.h
           sed -i 's/mp3dec_scratch_t scratch;/static mp3dec_scratch_t scratch;/g' main/minimp3.h
 
-      - name: Convert icon.png to 76x76 icon.bmp (if present)
-        shell: bash
-        run: |
-          python3 -m venv /tmp/iconv
-          /tmp/iconv/bin/pip install -q pillow
-          /tmp/iconv/bin/python - << 'PYEOF'
-          import os
-          from PIL import Image
-          for p in ("icon.png", "icon.PNG", "assets/icon.png"):
-              if os.path.exists(p):
-                  im = Image.open(p).convert("RGBA")
-                  im.thumbnail((76, 76), Image.Resampling.LANCZOS)
-                  cv = Image.new("RGBA", (76, 76), (0, 0, 0, 255))
-                  cv.alpha_composite(im, ((76 - im.width) // 2, (76 - im.height) // 2))
-                  cv.convert("RGB").save("icon.bmp", format="BMP")
-                  print(f"Converted {p} -> icon.bmp")
-                  break
-          PYEOF
-
-      - name: Build MP3Player.vmupack
+      - name: Build 4 isolation tests
         shell: bash
         run: |
           source /opt/esp/idf/export.sh
-          mkdir -p out
-          rm -f sdkconfig
-          idf.py set-target esp32s3
-          idf.py build
-          echo "=== LIBMAIN SYMBOLS ==="
-          xtensa-esp32s3-elf-nm -u build/esp-idf/main/libmain.a || true
-          chmod +x pack.sh
-          ./pack.sh
-          cp mp3_player.vmupack out/MP3Player.vmupack
+          ROOT="$(pwd)"
+          SDK_C="$ROOT/vmupro-sdk/sdk/c"
+          PACKER="$ROOT/vmupro-sdk/tools/packer/packer.sh"
+          chmod +x "$PACKER"
+          mkdir -p "$ROOT/out"
 
-      - name: Upload MP3Player .vmupack
+          # --- TEST 1: emubrowser ---
+          rm -rf /tmp/t1 && cp -r "$ROOT/vmupro-sdk/examples/network" /tmp/t1
+          sed -i "s|\${CMAKE_CURRENT_LIST_DIR}/../../sdk/c|$SDK_C|g" /tmp/t1/CMakeLists.txt
+          sed -i 's/"Network Example"/"Test1 Browser"/g' /tmp/t1/metadata.json
+          cat << 'EOF' > /tmp/t1/main/network.c
+          #include "vmupro_sdk.h"
+          void app_main(void){
+              vmupro_start_double_buffer_renderer();
+              bool run=true; char p[256]="Press A to browse";
+              while(run){
+                  vmupro_btn_read();
+                  if(vmupro_btn_pressed(Btn_B)) run=false;
+                  if(vmupro_btn_pressed(Btn_A)){
+                      vmupro_stop_double_buffer_renderer();
+                      vmupro_emubrowser_settings_t s = vmupro_emubrowser_defaults();
+                      s.rootPath="/sdcard/mp3/"; s.filterExtension=".mp3"; s.showFiles=true; s.showFolders=true;
+                      if(vmupro_emubrowser_init(s)==VMUPRO_EMUBROWSER_OK) vmupro_emubrowser_render_contents(p);
+                      vmupro_start_double_buffer_renderer();
+                  }
+                  vmupro_display_clear(VMUPRO_COLOR_BLACK); vmupro_set_font(VMUPRO_FONT_SMALL);
+                  vmupro_draw_text("Test1 Browser OK",10,30,VMUPRO_COLOR_VMUGREEN,VMUPRO_COLOR_BLACK);
+                  vmupro_draw_text(p,10,60,VMUPRO_COLOR_WHITE,VMUPRO_COLOR_BLACK);
+                  vmupro_push_double_buffer_frame(); vmupro_sleep_ms(33);
+              }
+              vmupro_stop_double_buffer_renderer();
+          }
+          EOF
+          (cd /tmp/t1 && idf.py set-target esp32s3 && idf.py build && "$PACKER" --appname network_example --icon icon.bmp --meta ./metadata.json --debug true)
+          cp /tmp/t1/network_example.vmupack "$ROOT/out/Test1_Browser.vmupack"
+
+          # --- TEST 2: Core Audio ---
+          rm -rf /tmp/t2 && cp -r "$ROOT/vmupro-sdk/examples/network" /tmp/t2
+          sed -i "s|\${CMAKE_CURRENT_LIST_DIR}/../../sdk/c|$SDK_C|g" /tmp/t2/CMakeLists.txt
+          sed -i 's/"Network Example"/"Test2 Audio"/g' /tmp/t2/metadata.json
+          cat << 'EOF' > /tmp/t2/main/network.c
+          #include "vmupro_sdk.h"
+          static int16_t beep[512];
+          void app_main(void){
+              for(int i=0;i<512;i++) beep[i]=((i/50)&1)?6000:-6000;
+              vmupro_audio_start_listen_mode();
+              vmupro_start_double_buffer_renderer();
+              bool run=true;
+              while(run){
+                  vmupro_btn_read();
+                  if(vmupro_btn_pressed(Btn_B)) run=false;
+                  if(vmupro_btn_held(Btn_A)) vmupro_audio_add_stream_samples(beep,512,VMUPRO_AUDIO_MONO,true);
+                  vmupro_display_clear(VMUPRO_COLOR_BLACK); vmupro_set_font(VMUPRO_FONT_SMALL);
+                  vmupro_draw_text("Test2 Audio OK",10,30,VMUPRO_COLOR_VMUGREEN,VMUPRO_COLOR_BLACK);
+                  vmupro_draw_text("Hold A: Beep  B: Exit",10,60,VMUPRO_COLOR_WHITE,VMUPRO_COLOR_BLACK);
+                  vmupro_push_double_buffer_frame(); vmupro_sleep_ms(16);
+              }
+              vmupro_stop_double_buffer_renderer();
+              vmupro_audio_exit_listen_mode();
+          }
+          EOF
+          (cd /tmp/t2 && idf.py set-target esp32s3 && idf.py build && "$PACKER" --appname network_example --icon icon.bmp --meta ./metadata.json --debug true)
+          cp /tmp/t2/network_example.vmupack "$ROOT/out/Test2_AudioCore.vmupack"
+
+          # --- TEST 3: Extra Audio APIs ---
+          rm -rf /tmp/t3 && cp -r "$ROOT/vmupro-sdk/examples/network" /tmp/t3
+          sed -i "s|\${CMAKE_CURRENT_LIST_DIR}/../../sdk/c|$SDK_C|g" /tmp/t3/CMakeLists.txt
+          sed -i 's/"Network Example"/"Test3 AudioExt"/g' /tmp/t3/metadata.json
+          cat << 'EOF' > /tmp/t3/main/network.c
+          #include "vmupro_sdk.h"
+          void app_main(void){
+              vmupro_audio_start_listen_mode();
+              vmupro_start_double_buffer_renderer();
+              uint8_t v = vmupro_get_global_volume();
+              vmupro_set_global_volume(v);
+              vmupro_audio_clear_ring_buffer();
+              uint32_t f=0,t=0; int pct=vmupro_get_ringbuffer_fill_state(&f,&t);
+              char s[40]; vmupro_snprintf(s,sizeof(s),"vol=%u pct=%d",(unsigned)v,pct);
+              bool run=true;
+              while(run){
+                  vmupro_btn_read(); if(vmupro_btn_pressed(Btn_B)) run=false;
+                  vmupro_display_clear(VMUPRO_COLOR_BLACK); vmupro_set_font(VMUPRO_FONT_SMALL);
+                  vmupro_draw_text("Test3 AudioExt OK",10,30,VMUPRO_COLOR_VMUGREEN,VMUPRO_COLOR_BLACK);
+                  vmupro_draw_text(s,10,60,VMUPRO_COLOR_WHITE,VMUPRO_COLOR_BLACK);
+                  vmupro_push_double_buffer_frame(); vmupro_sleep_ms(33);
+              }
+              vmupro_stop_double_buffer_renderer();
+              vmupro_audio_exit_listen_mode();
+          }
+          EOF
+          (cd /tmp/t3 && idf.py set-target esp32s3 && idf.py build && "$PACKER" --appname network_example --icon icon.bmp --meta ./metadata.json --debug true)
+          cp /tmp/t3/network_example.vmupack "$ROOT/out/Test3_AudioExtra.vmupack"
+
+          # --- TEST 4: minimp3 + fseek + memcmp + strrchr ---
+          rm -rf /tmp/t4 && cp -r "$ROOT/vmupro-sdk/examples/network" /tmp/t4
+          sed -i "s|\${CMAKE_CURRENT_LIST_DIR}/../../sdk/c|$SDK_C|g" /tmp/t4/CMakeLists.txt
+          sed -i 's/"Network Example"/"Test4 Minimp3"/g' /tmp/t4/metadata.json
+          cp "$ROOT/main/minimp3.h" /tmp/t4/main/
+          cat << 'EOF' > /tmp/t4/main/network.c
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          uint64_t __udivdi3(uint64_t n,uint64_t d){if(!d)return 0;uint64_t q=0,r=0;for(int i=63;i>=0;i--){r=(r<<1)|((n>>i)&1ULL);if(r>=d){r-=d;q|=(1ULL<<i);}}return q;}
+          float __divsf3(float a,float b){union{float f;uint32_t u;}ua={.f=a},ub={.f=b};uint32_t s=(ua.u^ub.u)&0x80000000U;int32_t ea=(ua.u>>23)&0xFF,eb=(ub.u>>23)&0xFF;if(!ea)return 0.0f;if(!eb)return s?-1e30f:1e30f;uint64_t ma=((uint64_t)(ua.u&0x7FFFFF)|0x800000ULL)<<24,mb=(uint64_t)(ub.u&0x7FFFFF)|0x800000ULL;uint32_t q=(uint32_t)__udivdi3(ma,mb);int32_t er=ea-eb+127;while(q>=0x01000000U){q>>=1;er++;}while(q<0x00800000U&&er>0){q<<=1;er--;}if(er<=0)return 0.0f;if(er>=255)er=254;union{uint32_t u;float f;}r;r.u=s|((uint32_t)er<<23)|(q&0x7FFFFFU);return r.f;}
+          void *memmove(void *dst,const void *src,size_t n){uint8_t*d=dst;const uint8_t*s=src;if(d<s){for(size_t i=0;i<n;i++)d[i]=s[i];}else if(d>s){for(size_t i=n;i>0;i--)d[i-1]=s[i-1];}return dst;}
+          #define MINIMP3_ONLY_MP3
+          #define MINIMP3_NO_SIMD
+          #define MINIMP3_IMPLEMENTATION
+          #include "minimp3.h"
+          #include "vmupro_sdk.h"
+          void app_main(void){
+              mp3dec_t *d = malloc(sizeof(mp3dec_t));
+              if(d) mp3dec_init(d);
+              const char *p = strrchr("/a/b.mp3", '/');
+              FILE *f = fopen("/sdcard/mp3/x.mp3", "rb");
+              if(f){ fseek(f, 0, SEEK_SET); fclose(f); }
+              int mc = memcmp("ab", "ac", 2);
+              (void)p; (void)mc;
+              vmupro_start_double_buffer_renderer();
+              bool run=true;
+              while(run){
+                  vmupro_btn_read(); if(vmupro_btn_pressed(Btn_B)) run=false;
+                  vmupro_display_clear(VMUPRO_COLOR_BLACK); vmupro_set_font(VMUPRO_FONT_SMALL);
+                  vmupro_draw_text("Test4 Minimp3 OK",10,30,VMUPRO_COLOR_VMUGREEN,VMUPRO_COLOR_BLACK);
+                  vmupro_push_double_buffer_frame(); vmupro_sleep_ms(33);
+              }
+              vmupro_stop_double_buffer_renderer();
+              if(d) free(d);
+          }
+          EOF
+          (cd /tmp/t4 && idf.py set-target esp32s3 && idf.py build && "$PACKER" --appname network_example --icon icon.bmp --meta ./metadata.json --debug true)
+          cp /tmp/t4/network_example.vmupack "$ROOT/out/Test4_Minimp3.vmupack"
+
+      - name: Upload 4 test .vmupack files
         uses: actions/upload-artifact@v4
         with:
-          name: mp3-player-vmupack
-          path: "out/MP3Player.vmupack"
+          name: mp3-isolation-tests
+          path: "out/*.vmupack"
