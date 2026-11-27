@@ -4,18 +4,20 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* --- Local replacements for symbols not exported by VMUPro OS --- */
+/* --- Local implementations of symbols not exported by VMUPro OS --- */
 
-/* 1. memmove replacement for minimp3 and libc calls */
-void *memmove(void *dst, const void *src, size_t n) {
-    uint8_t *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
-    if (d < s) {
-        for (size_t i = 0; i < n; i++) d[i] = s[i];
-    } else if (d > s) {
-        for (size_t i = n; i > 0; i--) d[i - 1] = s[i - 1];
+/* 1. 64-bit unsigned division helper (__udivdi3) */
+uint64_t __udivdi3(uint64_t n, uint64_t d) {
+    if (d == 0) return 0;
+    uint64_t q = 0, r = 0;
+    for (int i = 63; i >= 0; i--) {
+        r = (r << 1) | ((n >> i) & 1ULL);
+        if (r >= d) {
+            r -= d;
+            q |= (1ULL << i);
+        }
     }
-    return dst;
+    return q;
 }
 
 /* 2. Soft-float division helper (__divsf3) */
@@ -29,7 +31,7 @@ float __divsf3(float a, float b) {
 
     uint64_t man_a = ((uint64_t)(ua.u & 0x7FFFFF) | 0x800000ULL) << 24;
     uint64_t man_b = ((uint64_t)(ub.u & 0x7FFFFF) | 0x800000ULL);
-    uint32_t quot = (uint32_t)(man_a / man_b);
+    uint32_t quot = (uint32_t)__udivdi3(man_a, man_b);
     int32_t exp_r = exp_a - exp_b + 127;
 
     while (quot >= 0x01000000U) { quot >>= 1; exp_r++; }
@@ -41,6 +43,18 @@ float __divsf3(float a, float b) {
     union { uint32_t u; float f; } res;
     res.u = sign | ((uint32_t)exp_r << 23) | (quot & 0x7FFFFFU);
     return res.f;
+}
+
+/* 3. memmove replacement for minimp3 and libc */
+void *memmove(void *dst, const void *src, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    if (d < s) {
+        for (size_t i = 0; i < n; i++) d[i] = s[i];
+    } else if (d > s) {
+        for (size_t i = n; i > 0; i--) d[i - 1] = s[i - 1];
+    }
+    return dst;
 }
 
 #define MINIMP3_ONLY_MP3
@@ -259,7 +273,6 @@ static void pump_audio(void) {
             vmupro_audio_add_stream_samples(g_mono_buf, samples, VMUPRO_AUDIO_MONO, true);
             g_samples_played += (uint32_t)samples;
         } else {
-            /* 32-bit fixed-point resampling step (avoids 64-bit __udivdi3) */
             uint32_t step = (((uint32_t)g_sample_hz << 12) / (OUT_HZ >> 4));
             int out_cnt = 0;
             uint32_t limit = (uint32_t)samples << 16;
@@ -295,7 +308,7 @@ static void render_player(void) {
     vmupro_snprintf(hdr, sizeof(hdr), "Vol:%u%%", (unsigned)vol);
     vmupro_draw_text(hdr, 172, 6, VMUPRO_COLOR_WHITE, VMUPRO_COLOR_BLACK);
 
-    /* Track name box (filename only) */
+    /* Track name box */
     vmupro_draw_fill_rect(6, 26, 234, 72, VMUPRO_COLOR_NAVY);
     vmupro_draw_rect(6, 26, 234, 72, VMUPRO_COLOR_BLUE);
     char line1[30], line2[30];
@@ -323,14 +336,14 @@ static void render_player(void) {
         vmupro_draw_text(info_str, 126, 84, VMUPRO_COLOR_GREY, VMUPRO_COLOR_BLACK);
     }
 
-    /* Progress bar (pure 32-bit math, no __udivdi3) */
+    /* Progress bar */
     vmupro_draw_rect(10, 104, 230, 114, VMUPRO_COLOR_GREY);
     if (g_fp && g_file_size > (size_t)g_audio_start) {
         long cur = g_file_pos - (g_in_len - g_in_pos);
         if (cur < g_audio_start) cur = g_audio_start;
         uint32_t span = (uint32_t)(g_file_size - (size_t)g_audio_start);
         uint32_t pos = (uint32_t)(cur - g_audio_start);
-        int fill_w = (span > 0) ? (int)((pos / (span / 218U + 1U))) : 0;
+        int fill_w = (span > 0) ? (int)(pos / (span / 218U + 1U)) : 0;
         if (fill_w > 218) fill_w = 218;
         if (fill_w > 0) vmupro_draw_fill_rect(11, 105, 11 + fill_w, 113, VMUPRO_COLOR_VMUGREEN);
     }
